@@ -1,0 +1,399 @@
+name: Build Haris APK
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/com/haris/guard app/src/main/res/xml
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "haris"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.haris.guard"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.haris.guard"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.CAMERA"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-feature android:name="android.hardware.camera" android:required="false"/>
+              <application
+                  android:label="حارس الهاتف"
+                  android:icon="@android:drawable/ic_lock_idle_lock"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <receiver
+                      android:name=".AdminReceiver"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_DEVICE_ADMIN">
+                      <meta-data android:name="android.app.device_admin" android:resource="@xml/device_admin"/>
+                      <intent-filter>
+                          <action android:name="android.app.action.DEVICE_ADMIN_ENABLED"/>
+                      </intent-filter>
+                  </receiver>
+                  <service
+                      android:name=".GuardService"
+                      android:exported="false"
+                      android:foregroundServiceType="camera"/>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/xml/device_admin.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-policies>
+                  <watch-login/>
+              </uses-policies>
+          </device-admin>
+          EOF
+
+          cat > app/src/main/java/com/haris/guard/PhotoStore.kt <<'EOF'
+          package com.haris.guard
+
+          import android.content.Context
+          import java.io.File
+          import java.util.Date
+
+          object PhotoStore {
+              fun dir(c: Context): File = File(c.getExternalFilesDir(null), "intruders").also { it.mkdirs() }
+
+              fun log(c: Context, m: String) {
+                  try { File(c.filesDir, "log.txt").appendText("${Date()}  $m\n") } catch (_: Exception) {}
+              }
+
+              fun lastLog(c: Context): String {
+                  val f = File(c.filesDir, "log.txt")
+                  return if (f.exists()) f.readLines().takeLast(8).joinToString("\n") else "(فارغ)"
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/haris/guard/AdminReceiver.kt <<'EOF'
+          package com.haris.guard
+
+          import android.app.admin.DeviceAdminReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          class AdminReceiver : DeviceAdminReceiver() {
+              override fun onPasswordFailed(context: Context, intent: Intent) {
+                  PhotoStore.log(context, "محاولة فاشلة")
+                  val s = GuardService.instance
+                  if (s != null) s.capture() else PhotoStore.log(context, "الخدمة غير شغالة")
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/haris/guard/GuardService.kt <<'EOF'
+          package com.haris.guard
+
+          import android.annotation.SuppressLint
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.ImageFormat
+          import android.hardware.camera2.CameraCaptureSession
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraDevice
+          import android.hardware.camera2.CameraManager
+          import android.hardware.camera2.CaptureRequest
+          import android.media.ImageReader
+          import android.os.Build
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.IBinder
+          import java.io.File
+
+          class GuardService : Service() {
+              companion object {
+                  @Volatile var instance: GuardService? = null
+              }
+
+              private val thread = HandlerThread("cam").also { it.start() }
+              private val handler = Handler(thread.looper)
+              @Volatile private var busy = false
+              private var camRef: CameraDevice? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  instance = this
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("guard", "Guard", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "guard")
+                      .setContentTitle("حارس الهاتف يعمل")
+                      .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+                  } else {
+                      startForeground(1, n)
+                  }
+                  PhotoStore.log(this, "الحماية بدأت")
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+              override fun onDestroy() {
+                  instance = null
+                  super.onDestroy()
+              }
+
+              private fun release() {
+                  try { camRef?.close() } catch (_: Exception) {}
+                  camRef = null
+                  busy = false
+              }
+
+              @SuppressLint("MissingPermission")
+              fun capture() {
+                  if (busy) return
+                  busy = true
+                  handler.post {
+                      try {
+                          val cm = getSystemService(CameraManager::class.java)
+                          val id = cm.cameraIdList.first {
+                              cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) ==
+                                  CameraCharacteristics.LENS_FACING_FRONT
+                          }
+                          val reader = ImageReader.newInstance(640, 480, ImageFormat.JPEG, 2)
+                          var frames = 0
+                          reader.setOnImageAvailableListener({ r ->
+                              val img = r.acquireLatestImage()
+                              if (img != null) {
+                                  frames++
+                                  if (frames == 8) {
+                                      val b = img.planes[0].buffer
+                                      val bytes = ByteArray(b.remaining())
+                                      b.get(bytes)
+                                      File(PhotoStore.dir(this@GuardService), "img_${System.currentTimeMillis()}.jpg").writeBytes(bytes)
+                                      PhotoStore.log(this@GuardService, "تم حفظ صورة")
+                                      img.close()
+                                      release()
+                                      return@setOnImageAvailableListener
+                                  }
+                                  img.close()
+                              }
+                          }, handler)
+                          cm.openCamera(id, object : CameraDevice.StateCallback() {
+                              override fun onOpened(c: CameraDevice) {
+                                  camRef = c
+                                  try {
+                                      val req = c.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                                      req.addTarget(reader.surface)
+                                      req.set(CaptureRequest.JPEG_ORIENTATION, 270)
+                                      @Suppress("DEPRECATION")
+                                      c.createCaptureSession(listOf(reader.surface), object : CameraCaptureSession.StateCallback() {
+                                          override fun onConfigured(s: CameraCaptureSession) {
+                                              try { s.setRepeatingRequest(req.build(), null, handler) }
+                                              catch (e: Exception) { PhotoStore.log(this@GuardService, "خطأ: $e"); release() }
+                                          }
+                                          override fun onConfigureFailed(s: CameraCaptureSession) {
+                                              PhotoStore.log(this@GuardService, "فشل إعداد الكاميرا")
+                                              release()
+                                          }
+                                      }, handler)
+                                  } catch (e: Exception) {
+                                      PhotoStore.log(this@GuardService, "خطأ: $e")
+                                      release()
+                                  }
+                              }
+                              override fun onDisconnected(c: CameraDevice) { release() }
+                              override fun onError(c: CameraDevice, e: Int) {
+                                  PhotoStore.log(this@GuardService, "خطأ كاميرا $e")
+                                  release()
+                              }
+                          }, handler)
+                          handler.postDelayed({
+                              if (busy) {
+                                  PhotoStore.log(this@GuardService, "انتهت المهلة بدون صورة")
+                                  release()
+                              }
+                          }, 8000)
+                      } catch (e: Exception) {
+                          PhotoStore.log(this@GuardService, "خطأ: $e")
+                          release()
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/haris/guard/MainActivity.kt <<'EOF'
+          package com.haris.guard
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.admin.DevicePolicyManager
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.BitmapFactory
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.View
+          import android.widget.Button
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private lateinit var list: LinearLayout
+
+              private fun comp() = ComponentName(this, AdminReceiver::class.java)
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(40, 80, 40, 40)
+                  root.layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  root.setBackgroundColor(0xFF0B1220.toInt())
+
+                  val title = TextView(this)
+                  title.text = "حارس الهاتف"
+                  title.textSize = 24f
+                  title.setTextColor(0xFFFFFFFF.toInt())
+                  root.addView(title)
+
+                  status = TextView(this)
+                  status.setTextColor(0xFFCBD5E1.toInt())
+                  status.textSize = 15f
+                  root.addView(status)
+
+                  fun btn(t: String, f: () -> Unit) {
+                      val bt = Button(this)
+                      bt.text = t
+                      bt.setOnClickListener { f() }
+                      root.addView(bt)
+                  }
+                  btn("1. تفعيل صلاحية المراقبة") { askAdmin() }
+                  btn("2. تشغيل الحماية") { start() }
+                  btn("تحديث") { refresh() }
+
+                  list = LinearLayout(this)
+                  list.orientation = LinearLayout.VERTICAL
+                  root.addView(list)
+
+                  val sv = ScrollView(this)
+                  sv.addView(root)
+                  setContentView(sv)
+              }
+
+              private fun askAdmin() {
+                  val i = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+                  i.putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, comp())
+                  i.putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "لالتقاط صورة عند إدخال رمز قفل خاطئ")
+                  startActivity(i)
+              }
+
+              private fun start() {
+                  val need = mutableListOf(Manifest.permission.CAMERA)
+                  if (Build.VERSION.SDK_INT >= 33) need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  if (need.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) {
+                      requestPermissions(need.toTypedArray(), 1)
+                  } else {
+                      launch()
+                  }
+              }
+
+              private fun launch() {
+                  startForegroundService(Intent(this, GuardService::class.java))
+                  refresh()
+              }
+
+              override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, r: IntArray) {
+                  super.onRequestPermissionsResult(rc, p, r)
+                  if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) launch()
+              }
+
+              private fun refresh() {
+                  val dpm = getSystemService(DevicePolicyManager::class.java)
+                  val admin = dpm.isAdminActive(comp())
+                  val on = GuardService.instance != null
+                  status.text = "صلاحية المراقبة: " + (if (admin) "مفعّلة" else "غير مفعّلة") +
+                      "\nالحماية: " + (if (on) "تعمل" else "متوقفة") +
+                      "\n\nالسجل:\n" + PhotoStore.lastLog(this)
+                  list.removeAllViews()
+                  val files = PhotoStore.dir(this).listFiles()?.sortedByDescending { it.lastModified() }?.take(20)
+                  files?.forEach { f ->
+                      val iv = ImageView(this)
+                      val o = BitmapFactory.Options()
+                      o.inSampleSize = 2
+                      iv.setImageBitmap(BitmapFactory.decodeFile(f.path, o))
+                      iv.adjustViewBounds = true
+                      iv.setPadding(0, 24, 0, 0)
+                      list.addView(iv)
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+              }
+          }
+          EOF
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: haris-v1-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
