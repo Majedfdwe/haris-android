@@ -1,0 +1,798 @@
+name: Build Haris APK v5
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Generate project
+        run: |
+          mkdir -p app/src/main/java/com/haris/guard app/src/main/res/xml
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "haris"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.haris.guard"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.haris.guard"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 5
+                  versionName = "5.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.CAMERA"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-feature android:name="android.hardware.camera" android:required="false"/>
+              <application
+                  android:label="حارس الهاتف"
+                  android:icon="@android:drawable/ic_lock_idle_lock"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <receiver
+                      android:name=".AdminReceiver"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_DEVICE_ADMIN">
+                      <meta-data android:name="android.app.device_admin" android:resource="@xml/device_admin"/>
+                      <intent-filter>
+                          <action android:name="android.app.action.DEVICE_ADMIN_ENABLED"/>
+                      </intent-filter>
+                  </receiver>
+                  <service
+                      android:name=".GuardService"
+                      android:exported="false"
+                      android:foregroundServiceType="camera"/>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/xml/device_admin.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <device-admin xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-policies>
+                  <watch-login/>
+              </uses-policies>
+          </device-admin>
+          EOF
+
+          cat > app/src/main/java/com/haris/guard/PhotoStore.kt <<'EOF'
+          package com.haris.guard
+
+          import android.content.Context
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          object PhotoStore {
+              fun dir(c: Context): File = File(c.getExternalFilesDir(null), "intruders").also { it.mkdirs() }
+
+              fun log(c: Context, m: String) {
+                  try {
+                      val f = File(c.filesDir, "log.txt")
+                      if (f.exists() && f.length() > 20000) {
+                          f.writeText(f.readLines().takeLast(30).joinToString("\n") + "\n")
+                      }
+                      val t = SimpleDateFormat("HH:mm:ss dd/MM", Locale.US).format(Date())
+                      f.appendText("$t  $m\n")
+                  } catch (_: Exception) {}
+              }
+
+              fun lastLog(c: Context): String {
+                  val f = File(c.filesDir, "log.txt")
+                  return if (f.exists()) f.readLines().takeLast(8).joinToString("\n") else "(فارغ)"
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/haris/guard/Uploader.kt <<'EOF'
+          package com.haris.guard
+
+          import android.content.Context
+          import java.io.File
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          object Uploader {
+              private val lock = Any()
+              @Volatile private var lastMsg = ""
+
+              private fun prefs(c: Context) = c.getSharedPreferences("cfg", Context.MODE_PRIVATE)
+
+              fun token(c: Context): String = prefs(c).getString("token", "") ?: ""
+
+              fun chatId(c: Context): String = prefs(c).getString("chat", "") ?: ""
+
+              fun save(c: Context, token: String, chat: String) {
+                  val e = prefs(c).edit()
+                  if (token.isNotBlank()) e.putString("token", token.trim())
+                  if (chat.isNotBlank()) e.putString("chat", chat.trim())
+                  e.apply()
+              }
+
+              private fun result(code: Int): String = when (code) {
+                  200 -> "ok"
+                  401, 404 -> "التوكن غير صحيح"
+                  400 -> "رقم المحادثة خطأ أو لم تضغط Start في البوت"
+                  403 -> "البوت محظور أو لم تبدأ محادثته"
+                  else -> "خطأ $code"
+              }
+
+              fun sendText(c: Context, text: String): String {
+                  val t = token(c)
+                  val id = chatId(c)
+                  if (t.isBlank() || id.isBlank()) return "الإعدادات ناقصة"
+                  return try {
+                      val conn = URL("https://api.telegram.org/bot$t/sendMessage").openConnection() as HttpURLConnection
+                      conn.connectTimeout = 15000
+                      conn.readTimeout = 15000
+                      conn.requestMethod = "POST"
+                      conn.doOutput = true
+                      val body = "chat_id=" + URLEncoder.encode(id, "UTF-8") + "&text=" + URLEncoder.encode(text, "UTF-8")
+                      conn.outputStream.use { it.write(body.toByteArray()) }
+                      result(conn.responseCode)
+                  } catch (e: Exception) {
+                      "لا يوجد اتصال (" + e.javaClass.simpleName + ")"
+                  }
+              }
+
+              private fun sendPhoto(c: Context, f: File, caption: String): String {
+                  val t = token(c)
+                  val id = chatId(c)
+                  if (t.isBlank() || id.isBlank()) return "الإعدادات ناقصة"
+                  return try {
+                      val boundary = "----haris" + System.currentTimeMillis()
+                      val conn = URL("https://api.telegram.org/bot$t/sendPhoto").openConnection() as HttpURLConnection
+                      conn.connectTimeout = 20000
+                      conn.readTimeout = 30000
+                      conn.requestMethod = "POST"
+                      conn.doOutput = true
+                      conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+                      conn.setChunkedStreamingMode(0)
+                      conn.outputStream.use { os ->
+                          fun field(n: String, v: String) {
+                              os.write("--$boundary\r\nContent-Disposition: form-data; name=\"$n\"\r\n\r\n$v\r\n".toByteArray())
+                          }
+                          field("chat_id", id)
+                          field("caption", caption)
+                          os.write("--$boundary\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"${f.name}\"\r\nContent-Type: image/jpeg\r\n\r\n".toByteArray())
+                          os.write(f.readBytes())
+                          os.write("\r\n--$boundary--\r\n".toByteArray())
+                      }
+                      result(conn.responseCode)
+                  } catch (e: Exception) {
+                      "لا يوجد اتصال (" + e.javaClass.simpleName + ")"
+                  }
+              }
+
+              private fun logOnce(c: Context, m: String) {
+                  if (m != lastMsg) {
+                      lastMsg = m
+                      PhotoStore.log(c, m)
+                  }
+              }
+
+              fun flush(c: Context) {
+                  Thread {
+                      synchronized(lock) {
+                          if (token(c).isBlank()) return@synchronized
+                          val files = PhotoStore.dir(c).listFiles()
+                              ?.filter { it.name.startsWith("img_") }
+                              ?.sortedBy { it.lastModified() }
+                              ?: return@synchronized
+                          for (f in files) {
+                              val t = SimpleDateFormat("HH:mm:ss dd/MM", Locale.US).format(Date(f.lastModified()))
+                              val r = sendPhoto(c, f, "محاولة فتح خاطئة - $t")
+                              if (r == "ok") {
+                                  f.renameTo(File(f.parentFile, "sent_" + f.name))
+                                  lastMsg = ""
+                                  PhotoStore.log(c, "أُرسلت صورة إلى تيليجرام")
+                              } else {
+                                  logOnce(c, "فشل الإرسال: $r")
+                                  break
+                              }
+                          }
+                      }
+                  }.start()
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/haris/guard/AdminReceiver.kt <<'EOF'
+          package com.haris.guard
+
+          import android.app.admin.DeviceAdminReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          class AdminReceiver : DeviceAdminReceiver() {
+              override fun onPasswordFailed(context: Context, intent: Intent) {
+                  PhotoStore.log(context, "محاولة فاشلة")
+                  val s = GuardService.instance
+                  if (s != null) s.capture() else PhotoStore.log(context, "الخدمة غير شغالة")
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/haris/guard/GuardService.kt <<'EOF'
+          package com.haris.guard
+
+          import android.annotation.SuppressLint
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.graphics.ImageFormat
+          import android.hardware.camera2.CameraCaptureSession
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraDevice
+          import android.hardware.camera2.CameraManager
+          import android.hardware.camera2.CaptureRequest
+          import android.media.ImageReader
+          import android.os.Build
+          import android.os.Handler
+          import android.os.HandlerThread
+          import android.os.IBinder
+          import java.io.File
+
+          class GuardService : Service() {
+              companion object {
+                  @Volatile var instance: GuardService? = null
+              }
+
+              private val thread = HandlerThread("cam").also { it.start() }
+              private val handler = Handler(thread.looper)
+              @Volatile private var busy = false
+              private var gen = 0
+              private var camRef: CameraDevice? = null
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      Uploader.flush(applicationContext)
+                      handler.postDelayed(this, 60000)
+                  }
+              }
+
+              override fun onCreate() {
+                  super.onCreate()
+                  instance = this
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel("guard", "Guard", NotificationManager.IMPORTANCE_LOW))
+                  val n = Notification.Builder(this, "guard")
+                      .setContentTitle("حارس الهاتف يعمل")
+                      .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 30) {
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+                  } else {
+                      startForeground(1, n)
+                  }
+                  PhotoStore.log(this, "الحماية بدأت")
+                  handler.post(tick)
+              }
+
+              override fun onBind(intent: Intent?): IBinder? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+
+              override fun onDestroy() {
+                  handler.removeCallbacks(tick)
+                  instance = null
+                  super.onDestroy()
+              }
+
+              private fun release() {
+                  try { camRef?.close() } catch (_: Exception) {}
+                  camRef = null
+                  busy = false
+              }
+
+              @SuppressLint("MissingPermission")
+              fun capture() {
+                  if (busy) return
+                  busy = true
+                  gen++
+                  val myGen = gen
+                  handler.post {
+                      try {
+                          val cm = getSystemService(CameraManager::class.java)
+                          val id = cm.cameraIdList.first {
+                              cm.getCameraCharacteristics(it).get(CameraCharacteristics.LENS_FACING) ==
+                                  CameraCharacteristics.LENS_FACING_FRONT
+                          }
+                          val ch = cm.getCameraCharacteristics(id)
+                          val slow = ch.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)?.minByOrNull { it.upper }
+                          val comp = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE)
+                          val reader = ImageReader.newInstance(640, 480, ImageFormat.JPEG, 2)
+                          var frames = 0
+                          reader.setOnImageAvailableListener({ r ->
+                              val img = r.acquireLatestImage()
+                              if (img != null) {
+                                  frames++
+                                  if (frames == 20 && myGen == gen) {
+                                      val b = img.planes[0].buffer
+                                      val bytes = ByteArray(b.remaining())
+                                      b.get(bytes)
+                                      File(PhotoStore.dir(this@GuardService), "img_${System.currentTimeMillis()}.jpg").writeBytes(bytes)
+                                      PhotoStore.log(this@GuardService, "تم حفظ صورة")
+                                      img.close()
+                                      release()
+                                      Uploader.flush(applicationContext)
+                                      return@setOnImageAvailableListener
+                                  }
+                                  img.close()
+                              }
+                          }, handler)
+                          cm.openCamera(id, object : CameraDevice.StateCallback() {
+                              override fun onOpened(c: CameraDevice) {
+                                  camRef = c
+                                  try {
+                                      val req = c.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                                      req.addTarget(reader.surface)
+                                      req.set(CaptureRequest.JPEG_ORIENTATION, 270)
+                                      if (slow != null) req.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, slow)
+                                      if (comp != null) req.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, comp.upper / 2)
+                                      @Suppress("DEPRECATION")
+                                      c.createCaptureSession(listOf(reader.surface), object : CameraCaptureSession.StateCallback() {
+                                          override fun onConfigured(s: CameraCaptureSession) {
+                                              try { s.setRepeatingRequest(req.build(), null, handler) }
+                                              catch (e: Exception) { PhotoStore.log(this@GuardService, "خطأ: $e"); release() }
+                                          }
+                                          override fun onConfigureFailed(s: CameraCaptureSession) {
+                                              PhotoStore.log(this@GuardService, "فشل إعداد الكاميرا")
+                                              release()
+                                          }
+                                      }, handler)
+                                  } catch (e: Exception) {
+                                      PhotoStore.log(this@GuardService, "خطأ: $e")
+                                      release()
+                                  }
+                              }
+                              override fun onDisconnected(c: CameraDevice) { release() }
+                              override fun onError(c: CameraDevice, e: Int) {
+                                  PhotoStore.log(this@GuardService, "خطأ كاميرا $e")
+                                  release()
+                              }
+                          }, handler)
+                          handler.postDelayed({
+                              if (busy && myGen == gen) {
+                                  PhotoStore.log(this@GuardService, "انتهت المهلة بدون صورة")
+                                  release()
+                              }
+                          }, 12000)
+                      } catch (e: Exception) {
+                          PhotoStore.log(this@GuardService, "خطأ: $e")
+                          release()
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/haris/guard/Invite.kt <<'EOF'
+          package com.haris.guard
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+
+          object Invite {
+              const val PROJECT = "hars-983d4"
+              const val API_KEY = ""
+              const val LINK = "https://github.com/Majedfdwe/haris-android/releases/latest"
+              private const val BASE = "https://firestore.googleapis.com/v1/projects/$PROJECT/databases/(default)/documents"
+
+              private fun prefs(c: Context) = c.getSharedPreferences("invite", Context.MODE_PRIVATE)
+
+              fun myCode(c: Context): String {
+                  val p = prefs(c)
+                  var code = p.getString("code", "") ?: ""
+                  if (code.isBlank()) {
+                      val chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+                      code = (1..6).map { chars.random() }.joinToString("")
+                      p.edit().putString("code", code).apply()
+                  }
+                  return code
+              }
+
+              fun invitedBy(c: Context): String = prefs(c).getString("by", "") ?: ""
+
+              private fun url(path: String, query: String = ""): URL {
+                  val key = if (API_KEY.isBlank()) "" else "key=$API_KEY"
+                  val q = listOf(query, key).filter { it.isNotBlank() }.joinToString("&")
+                  return URL(BASE + path + (if (q.isEmpty()) "" else "?$q"))
+              }
+
+              private fun call(u: URL, method: String, body: String?): Pair<Int, String> {
+                  val conn = u.openConnection() as HttpURLConnection
+                  conn.connectTimeout = 15000
+                  conn.readTimeout = 15000
+                  if (method == "PATCH") {
+                      conn.requestMethod = "POST"
+                      conn.setRequestProperty("X-HTTP-Method-Override", "PATCH")
+                  } else {
+                      conn.requestMethod = method
+                  }
+                  if (body != null) {
+                      conn.doOutput = true
+                      conn.setRequestProperty("Content-Type", "application/json")
+                      conn.outputStream.use { it.write(body.toByteArray()) }
+                  }
+                  val status = conn.responseCode
+                  val stream = if (status in 200..299) conn.inputStream else conn.errorStream
+                  val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
+                  return Pair(status, text)
+              }
+
+              private fun inviterBody(value: String): String {
+                  val fields = JSONObject().put("inviter", JSONObject().put("stringValue", value))
+                  return JSONObject().put("fields", fields).toString()
+              }
+
+              fun register(c: Context): String {
+                  return try {
+                      val p = prefs(c)
+                      if (p.getBoolean("reg", false)) return "ok"
+                      val fields = JSONObject()
+                          .put("inviter", JSONObject().put("stringValue", ""))
+                          .put("created", JSONObject().put("integerValue", System.currentTimeMillis().toString()))
+                      val body = JSONObject().put("fields", fields).toString()
+                      val r = call(url("/members", "documentId=" + myCode(c)), "POST", body)
+                      if (r.first == 200 || r.first == 409) {
+                          p.edit().putBoolean("reg", true).apply()
+                          "ok"
+                      } else {
+                          "تعذّر التسجيل (" + r.first + ")"
+                      }
+                  } catch (e: Exception) {
+                      "لا يوجد اتصال"
+                  }
+              }
+
+              fun claim(c: Context, raw: String): String {
+                  return try {
+                      val code = raw.trim().uppercase()
+                      if (code.length != 6) return "الرمز يجب أن يكون 6 خانات"
+                      if (code == myCode(c)) return "لا يمكنك استخدام رمزك أنت"
+                      if (invitedBy(c).isNotBlank()) return "سجّلت رمز دعوة من قبل"
+                      val reg = register(c)
+                      if (reg != "ok") return reg
+                      val g = call(url("/members/" + code), "GET", null)
+                      if (g.first == 404) return "هذا الرمز غير موجود"
+                      if (g.first != 200) return "تعذّر التحقق (" + g.first + ")"
+                      val r = call(url("/members/" + myCode(c), "updateMask.fieldPaths=inviter"), "PATCH", inviterBody(code))
+                      if (r.first == 200) {
+                          prefs(c).edit().putString("by", code).apply()
+                          "تم تسجيل رمز الدعوة"
+                      } else {
+                          "تعذّر التسجيل (" + r.first + ")"
+                      }
+                  } catch (e: Exception) {
+                      "لا يوجد اتصال"
+                  }
+              }
+
+              fun count(c: Context): String {
+                  return try {
+                      register(c)
+                      val value = JSONObject().put("stringValue", myCode(c))
+                      val filter = JSONObject()
+                          .put("field", JSONObject().put("fieldPath", "inviter"))
+                          .put("op", "EQUAL")
+                          .put("value", value)
+                      val sq = JSONObject()
+                          .put("from", JSONArray().put(JSONObject().put("collectionId", "members")))
+                          .put("where", JSONObject().put("fieldFilter", filter))
+                      val agg = JSONArray().put(JSONObject().put("alias", "n").put("count", JSONObject()))
+                      val q = JSONObject().put(
+                          "structuredAggregationQuery",
+                          JSONObject().put("structuredQuery", sq).put("aggregations", agg)
+                      )
+                      val r = call(url(":runAggregationQuery"), "POST", q.toString())
+                      if (r.first != 200) return "تعذّر (" + r.first + ")"
+                      JSONArray(r.second).getJSONObject(0).getJSONObject("result")
+                          .getJSONObject("aggregateFields").getJSONObject("n").getString("integerValue")
+                  } catch (e: Exception) {
+                      "لا يوجد اتصال"
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/haris/guard/About.kt <<'EOF'
+          package com.haris.guard
+
+          object About {
+              const val TITLE = "عن المطوّر"
+              const val TEXT = "ماجد أبو سيدرا\n\nمطوّر تطبيقات عربية للهواتف، يبني تطبيقاته بنفسه من هاتفه.\n\nصُمّم «حارس الهاتف» ليلتقط صورة لمن يحاول فتح هاتفك برمز خاطئ ويرسلها إليك على تيليجرام. الصور تُرسل إلى حسابك أنت فقط، ولا يراها أحد غيرك."
+          }
+          EOF
+
+          cat > app/src/main/java/com/haris/guard/MainActivity.kt <<'EOF'
+          package com.haris.guard
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.app.admin.DevicePolicyManager
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.BitmapFactory
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.View
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.ImageView
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private lateinit var status: TextView
+              private lateinit var list: LinearLayout
+              private lateinit var root: LinearLayout
+              private lateinit var tokenBox: EditText
+              private lateinit var chatBox: EditText
+              private lateinit var inviterBox: EditText
+              private lateinit var inviteInfo: TextView
+
+              private fun comp() = ComponentName(this, AdminReceiver::class.java)
+
+              private fun btn(t: String, f: () -> Unit) {
+                  val bt = Button(this)
+                  bt.text = t
+                  bt.setOnClickListener { f() }
+                  root.addView(bt)
+              }
+
+              private fun field(hint: String): EditText {
+                  val e = EditText(this)
+                  e.hint = hint
+                  e.setTextColor(0xFFFFFFFF.toInt())
+                  e.setHintTextColor(0xFF94A3B8.toInt())
+                  e.setSingleLine(true)
+                  e.textDirection = View.TEXT_DIRECTION_LTR
+                  root.addView(e)
+                  return e
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(40, 80, 40, 40)
+                  root.layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  root.setBackgroundColor(0xFF0B1220.toInt())
+
+                  val title = TextView(this)
+                  title.text = "حارس الهاتف"
+                  title.textSize = 24f
+                  title.setTextColor(0xFFFFFFFF.toInt())
+                  root.addView(title)
+
+                  status = TextView(this)
+                  status.setTextColor(0xFFCBD5E1.toInt())
+                  status.textSize = 15f
+                  root.addView(status)
+
+                  val help = TextView(this)
+                  help.text = "قبل البدء (مرة واحدة):\n1. افتح تيليجرام وابحث عن @BotFather ثم أرسل /newbot واتبع الخطوات لتحصل على التوكن.\n2. ابحث عن @userinfobot وأرسل له أي رسالة ليعطيك رقم محادثتك.\n3. افتح بوتك الجديد واضغط Start.\n4. الصق التوكن والرقم في الخانتين أدناه ثم اضغط حفظ."
+                  help.setTextColor(0xFF94A3B8.toInt())
+                  help.textSize = 13f
+                  help.setPadding(0, 24, 0, 24)
+                  root.addView(help)
+
+                  tokenBox = field("الصق التوكن هنا")
+                  chatBox = field("رقم المحادثة (Chat ID)")
+                  chatBox.setText(Uploader.chatId(this))
+
+                  btn("حفظ إعدادات تيليجرام") { saveCfg() }
+                  btn("إرسال رسالة تجربة") { testMsg() }
+                  btn("1. تفعيل صلاحية المراقبة") { askAdmin() }
+                  btn("2. تشغيل الحماية") { start() }
+                  btn("تحديث") { refresh() }
+
+                  val inviteTitle = TextView(this)
+                  inviteTitle.text = "ادعُ أصدقاءك"
+                  inviteTitle.textSize = 18f
+                  inviteTitle.setTextColor(0xFFFFFFFF.toInt())
+                  inviteTitle.setPadding(0, 48, 0, 8)
+                  root.addView(inviteTitle)
+
+                  inviteInfo = TextView(this)
+                  inviteInfo.setTextColor(0xFFCBD5E1.toInt())
+                  inviteInfo.textSize = 15f
+                  inviteInfo.text = "رمز دعوتك: " + Invite.myCode(this)
+                  root.addView(inviteInfo)
+
+                  btn("مشاركة رابط الدعوة") { shareInvite() }
+                  btn("تحديث عدد المسجّلين") { showCount() }
+                  inviterBox = field("رمز دعوة من صديق (اختياري)")
+                  btn("تسجيل رمز الدعوة") { claimCode() }
+                  btn("عن المطوّر") { showAbout() }
+
+                  list = LinearLayout(this)
+                  list.orientation = LinearLayout.VERTICAL
+                  root.addView(list)
+
+                  val sv = ScrollView(this)
+                  sv.addView(root)
+                  setContentView(sv)
+              }
+
+              private fun shareInvite() {
+                  val i = Intent(Intent.ACTION_SEND)
+                  i.type = "text/plain"
+                  i.putExtra(Intent.EXTRA_TEXT, "جرّب تطبيق حارس الهاتف، يصوّر من يحاول فتح هاتفك برمز خاطئ:\n" + Invite.LINK + "\nرمز دعوتي: " + Invite.myCode(this) + "\nأدخله داخل التطبيق بعد التثبيت.")
+                  startActivity(Intent.createChooser(i, "مشاركة"))
+              }
+
+              private fun showCount() {
+                  val ctx = applicationContext
+                  Thread {
+                      val n = Invite.count(ctx)
+                      runOnUiThread {
+                          inviteInfo.text = "رمز دعوتك: " + Invite.myCode(ctx) + "\nعدد من سجّلوا برمزك: " + n
+                      }
+                  }.start()
+              }
+
+              private fun claimCode() {
+                  val ctx = applicationContext
+                  val code = inviterBox.text.toString()
+                  Thread {
+                      val r = Invite.claim(ctx, code)
+                      runOnUiThread {
+                          Toast.makeText(this, r, Toast.LENGTH_LONG).show()
+                          if (r.startsWith("تم")) inviterBox.setText("")
+                      }
+                  }.start()
+              }
+
+              private fun showAbout() {
+                  AlertDialog.Builder(this)
+                      .setTitle(About.TITLE)
+                      .setMessage(About.TEXT)
+                      .setPositiveButton("إغلاق", null)
+                      .show()
+              }
+
+              private fun saveCfg() {
+                  Uploader.save(this, tokenBox.text.toString(), chatBox.text.toString())
+                  tokenBox.setText("")
+                  Toast.makeText(this, "تم الحفظ", Toast.LENGTH_SHORT).show()
+                  refresh()
+              }
+
+              private fun testMsg() {
+                  val ctx = applicationContext
+                  Thread {
+                      val r = Uploader.sendText(ctx, "رسالة تجربة من حارس الهاتف")
+                      runOnUiThread {
+                          val m = if (r == "ok") "وصلت الرسالة، افتح تيليجرام" else r
+                          Toast.makeText(this, m, Toast.LENGTH_LONG).show()
+                      }
+                  }.start()
+              }
+
+              private fun askAdmin() {
+                  val i = Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+                  i.putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, comp())
+                  i.putExtra(DevicePolicyManager.EXTRA_ADD_EXPLANATION, "لالتقاط صورة عند إدخال رمز قفل خاطئ")
+                  startActivity(i)
+              }
+
+              private fun start() {
+                  val need = mutableListOf(Manifest.permission.CAMERA)
+                  if (Build.VERSION.SDK_INT >= 33) need.add(Manifest.permission.POST_NOTIFICATIONS)
+                  if (need.any { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) {
+                      requestPermissions(need.toTypedArray(), 1)
+                  } else {
+                      launch()
+                  }
+              }
+
+              private fun launch() {
+                  startForegroundService(Intent(this, GuardService::class.java))
+                  refresh()
+              }
+
+              override fun onRequestPermissionsResult(rc: Int, p: Array<out String>, r: IntArray) {
+                  super.onRequestPermissionsResult(rc, p, r)
+                  if (checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) launch()
+              }
+
+              private fun refresh() {
+                  val dpm = getSystemService(DevicePolicyManager::class.java)
+                  val admin = dpm.isAdminActive(comp())
+                  val on = GuardService.instance != null
+                  val tg = Uploader.token(this).isNotBlank()
+                  status.text = "صلاحية المراقبة: " + (if (admin) "مفعّلة" else "غير مفعّلة") +
+                      "\nالحماية: " + (if (on) "تعمل" else "متوقفة") +
+                      "\nتيليجرام: " + (if (tg && Uploader.chatId(this).isNotBlank()) "جاهز" else "أكمل التوكن ورقم المحادثة") +
+                      "\n\nالسجل:\n" + PhotoStore.lastLog(this)
+                  list.removeAllViews()
+                  val files = PhotoStore.dir(this).listFiles()?.sortedByDescending { it.lastModified() }?.take(20)
+                  files?.forEach { f ->
+                      val iv = ImageView(this)
+                      val o = BitmapFactory.Options()
+                      o.inSampleSize = 2
+                      iv.setImageBitmap(BitmapFactory.decodeFile(f.path, o))
+                      iv.adjustViewBounds = true
+                      iv.setPadding(0, 24, 0, 0)
+                      list.addView(iv)
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  refresh()
+                  Uploader.flush(applicationContext)
+                  showCount()
+              }
+          }
+          EOF
+
+      - name: Build
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: haris-v5-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
